@@ -82,6 +82,25 @@ impl<C> CmdArg<C> {
         }
     }
 
+    /// Whether the request runs on one particular node (a fan-out's sub-request or an
+    /// address-routed command) rather than wherever its slot lives.
+    fn is_pinned_to_node(&self) -> bool {
+        let pinned = |route: &InternalSingleNodeRouting<C>| {
+            matches!(
+                route,
+                InternalSingleNodeRouting::Connection { .. }
+                    | InternalSingleNodeRouting::ByAddress(_)
+            )
+        };
+        match self {
+            Self::Reconnect(_) => false,
+            Self::Cmd { routing, .. } => {
+                matches!(routing, InternalRoutingInfo::SingleNode(route) if pinned(route))
+            }
+            Self::Pipeline { route, .. } => pinned(route),
+        }
+    }
+
     fn reset_routing(&mut self) {
         let fix_route = |route: &mut InternalSingleNodeRouting<C>| {
             while let InternalSingleNodeRouting::Redirect {
@@ -228,14 +247,20 @@ pub(crate) fn choose_response<C>(
 
         // A connection whose packets are silently dropped never fails on its own; the
         // response timeout is the only sign of it. Retrying on that connection would
-        // wait out every retry, so repair it (a PING decides whether to replace it).
-        (OperationTarget::Node { address }, _) if err.is_timeout() => (
-            retry_or_send!(|mut request: PendingRequest<C>| {
-                request.cmd.reset_routing();
-                Retry::MoveToPending { request }
-            }),
-            PollFlushAction::Reconnect(HashSet::from([address])),
-        ),
+        // wait out every retry, so repair it (a PING decides whether to replace it). A request
+        // pinned to the node keeps retrying in place: it can't be re-routed, and looking its
+        // node up while under repair would escalate to reconnecting every node.
+        (OperationTarget::Node { address }, _)
+            if err.is_timeout() && !request.cmd.is_pinned_to_node() =>
+        {
+            (
+                retry_or_send!(|mut request: PendingRequest<C>| {
+                    request.cmd.reset_routing();
+                    Retry::MoveToPending { request }
+                }),
+                PollFlushAction::Reconnect(HashSet::from([address])),
+            )
+        }
 
         (OperationTarget::Node { address }, RetryMethod::Reconnect) => (
             retry_or_send!(|mut request: PendingRequest<C>| {

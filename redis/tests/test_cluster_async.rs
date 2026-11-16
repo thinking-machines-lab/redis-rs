@@ -1658,6 +1658,155 @@ mod cluster_async {
         );
     }
 
+    // A fan-out sub-request that times out is retried on its node while that node is repaired.
+    // Looking the node up by address must not fail and escalate to reconnecting every node.
+    #[test]
+    fn test_async_cluster_fan_out_timeout_does_not_reconnect_every_node() {
+        let name = "test_async_cluster_fan_out_timeout_does_not_reconnect_every_node";
+        const STUCK_CHECK: Duration = Duration::from_secs(15);
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let MockEnv {
+            async_connection: connection,
+            handler: _handler,
+            runtime,
+            ..
+        } = MockEnv::new(name, {
+            let timed_out = timed_out.clone();
+            move |cmd: &[u8], port| {
+                respond_startup_two_nodes(name, cmd)?;
+                if port == 6379
+                    && contains_slice(cmd, b"FLUSHALL")
+                    && !timed_out.swap(true, Ordering::SeqCst)
+                {
+                    return Err(Err(
+                        std::io::Error::from(std::io::ErrorKind::TimedOut).into()
+                    ));
+                }
+                Err(Ok(Value::Okay))
+            }
+        });
+        add_mock_delay(name, move |cmd, port| {
+            if port == 6379 && is_connection_check(cmd) && timed_out.load(Ordering::SeqCst) {
+                STUCK_CHECK
+            } else {
+                Duration::ZERO
+            }
+        });
+
+        let healthy_latency = runtime.block_on(async move {
+            tokio::time::pause();
+            let mut fan_out = connection.clone();
+            let mut healthy = connection;
+            let _fan_out = tokio::spawn(async move {
+                fan_out
+                    .route_command(
+                        cmd("FLUSHALL"),
+                        RoutingInfo::MultiNode((
+                            MultipleNodeRoutingInfo::AllNodes,
+                            Some(ResponsePolicy::AllSucceeded),
+                        )),
+                    )
+                    .await
+            });
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let start = tokio::time::Instant::now();
+            let result = cmd("GET")
+                .arg("{foo}k")
+                .query_async::<Value>(&mut healthy)
+                .await;
+            assert_eq!(result, Ok(Value::Okay));
+            start.elapsed()
+        });
+        assert!(
+            healthy_latency < STUCK_CHECK / 2,
+            "a healthy shard waited {healthy_latency:?} behind a fan-out timeout"
+        );
+    }
+
+    // A failed inline repair during a slot refresh must not leave the node excluded from later
+    // refreshes, or fan-outs skip it indefinitely.
+    #[test]
+    fn test_async_cluster_failed_inline_repair_is_retried_by_the_next_refresh() {
+        let name = "test_async_cluster_failed_inline_repair_is_retried_by_the_next_refresh";
+        let broken = Arc::new(AtomicBool::new(false));
+        let checked_broken_node = Arc::new(AtomicBool::new(false));
+        let refresh_gets = Arc::new(AtomicU32::new(0));
+        let flushed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let MockEnv {
+            async_connection: mut connection,
+            handler: _handler,
+            runtime,
+            ..
+        } = MockEnv::new(name, {
+            let broken = broken.clone();
+            let flushed = flushed.clone();
+            move |cmd: &[u8], port| {
+                if broken.load(Ordering::SeqCst) {
+                    let slots = contains_slice(cmd, b"CLUSTER") && contains_slice(cmd, b"SLOTS");
+                    if port == 6379 && is_connection_check(cmd) {
+                        checked_broken_node.store(true, Ordering::SeqCst);
+                        return Err(Err(broken_pipe_error()));
+                    }
+                    if port == 6379 && slots {
+                        return Err(Err(broken_pipe_error()));
+                    }
+                    // 6380 can't supply the topology until 6379 has failed an inline repair, so
+                    // whatever order a refresh tries the nodes in, 6379 ends up failing one.
+                    if port == 6380 && slots && !checked_broken_node.load(Ordering::SeqCst) {
+                        return Err(Err(broken_pipe_error()));
+                    }
+                }
+                respond_startup_two_nodes(name, cmd)?;
+                if contains_slice(cmd, b"FLUSHALL") {
+                    flushed.lock().unwrap().push(port);
+                }
+                // Every other GET of {foo}refresh is a MOVED to its own node: only a slot refresh.
+                if contains_slice(cmd, b"{foo}refresh")
+                    && refresh_gets
+                        .fetch_add(1, Ordering::SeqCst)
+                        .is_multiple_of(2)
+                {
+                    return Err(parse_redis_value(
+                        format!("-MOVED 12182 {name}:6380\r\n").as_bytes(),
+                    ));
+                }
+                Err(Ok(Value::Okay))
+            }
+        });
+
+        runtime.block_on(async move {
+            let refresh = async |connection: &mut ClusterConnection<MockConnection>| {
+                let _ = cmd("GET")
+                    .arg("{foo}refresh")
+                    .query_async::<Value>(connection)
+                    .await;
+            };
+            broken.store(true, Ordering::SeqCst);
+            refresh(&mut connection).await;
+            refresh(&mut connection).await;
+            broken.store(false, Ordering::SeqCst);
+            refresh(&mut connection).await;
+
+            let result = connection
+                .route_command(
+                    cmd("FLUSHALL"),
+                    RoutingInfo::MultiNode((
+                        MultipleNodeRoutingInfo::AllNodes,
+                        Some(ResponsePolicy::AllSucceeded),
+                    )),
+                )
+                .await;
+            assert_eq!(result, Ok(Value::Okay));
+        });
+        let mut flushed = flushed.lock().unwrap().clone();
+        flushed.sort();
+        assert_eq!(
+            flushed,
+            vec![6379, 6380],
+            "a node was left out of the fan-out"
+        );
+    }
+
     // The sub-requests of a fan-out are queued while the in-flight requests are being polled, so
     // they must wake the connection task instead of waiting for an unrelated request to finish.
     #[test]

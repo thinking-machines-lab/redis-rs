@@ -1015,6 +1015,10 @@ where
         // We include Connected connections in this pass, in addition to the first pass above,
         // so that we can do inline connection repairs, if needed (via `get_or_create_conn`).
         if !found {
+            // A node that fails this inline repair is dropped from the map, so the connection
+            // refresh below (or the next one) reconnects it; left as `Connecting` it would be
+            // mistaken for a node a `reconnect_loop` is repairing and skipped indefinitely.
+            let mut failed = Vec::new();
             for (addr, state) in &mut *connections {
                 let prev = std::mem::replace(state, ConnState::Connecting).into_conn();
                 match get_or_create_conn(
@@ -1037,8 +1041,14 @@ where
                             Err(err) => last_err = Some(err),
                         }
                     }
-                    Err(err) => last_err = Some(err),
+                    Err(err) => {
+                        failed.push(addr.clone());
+                        last_err = Some(err);
+                    }
                 }
+            }
+            for addr in failed {
+                connections.remove(&addr);
             }
         }
 
