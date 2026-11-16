@@ -1052,6 +1052,17 @@ where
         // served by another node, which the resubscription below moves the subscriptions to.
         connections.retain(|addr, _| nodes.contains(addr));
 
+        // A node under repair belongs to its `reconnect_loop`. Checking its old connection here
+        // would wait out a response timeout on it while holding the lock, stalling every shard.
+        let nodes = nodes
+            .into_iter()
+            .filter(|addr| {
+                !matches!(
+                    connections.get(addr),
+                    Some(ConnState::Reconnecting(_) | ConnState::Connecting)
+                )
+            })
+            .collect();
         self.refresh_connections_locked(connections, nodes).await;
 
         // The slot map may have changed, so resubscribe every node only to the subscriptions whose

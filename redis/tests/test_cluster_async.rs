@@ -1591,6 +1591,73 @@ mod cluster_async {
         );
     }
 
+    // While a timed-out node is repaired in the background, its retry lands on another shard and
+    // the MOVED reply triggers a slot refresh. That refresh must not wait on the stuck connection
+    // under the connection-map lock, or every healthy shard stalls for a response timeout.
+    #[test]
+    fn test_async_cluster_slot_refresh_does_not_wait_on_a_node_under_repair() {
+        let name = "test_async_cluster_slot_refresh_does_not_wait_on_a_node_under_repair";
+        const STUCK_CHECK: Duration = Duration::from_secs(15);
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let MockEnv {
+            async_connection: connection,
+            handler: _handler,
+            runtime,
+            ..
+        } = MockEnv::new(name, {
+            let timed_out = timed_out.clone();
+            move |cmd: &[u8], port| {
+                respond_startup_two_nodes(name, cmd)?;
+                // {bar} hashes to slot 5061 on 6379, {foo} to slot 12182 on 6380.
+                let bar = contains_slice(cmd, b"{bar}");
+                if port == 6379 && bar && !timed_out.swap(true, Ordering::SeqCst) {
+                    return Err(Err(
+                        std::io::Error::from(std::io::ErrorKind::TimedOut).into()
+                    ));
+                }
+                if port == 6380 && bar {
+                    return Err(parse_redis_value(
+                        format!("-MOVED 5061 {name}:6379\r\n").as_bytes(),
+                    ));
+                }
+                Err(Ok(Value::Okay))
+            }
+        });
+        add_mock_delay(name, move |cmd, port| {
+            if port == 6379 && is_connection_check(cmd) && timed_out.load(Ordering::SeqCst) {
+                STUCK_CHECK
+            } else {
+                Duration::ZERO
+            }
+        });
+
+        let healthy_latency = runtime.block_on(async move {
+            tokio::time::pause();
+            let mut stuck = connection.clone();
+            let mut healthy = connection;
+            let _stuck = tokio::spawn(async move {
+                cmd("SET")
+                    .arg("{bar}k")
+                    .arg("v")
+                    .query_async::<Value>(&mut stuck)
+                    .await
+            });
+            // Let the timeout, the retry's MOVED and the slot refresh start.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let start = tokio::time::Instant::now();
+            let result = cmd("GET")
+                .arg("{foo}k")
+                .query_async::<Value>(&mut healthy)
+                .await;
+            assert_eq!(result, Ok(Value::Okay));
+            start.elapsed()
+        });
+        assert!(
+            healthy_latency < STUCK_CHECK / 2,
+            "a healthy shard waited {healthy_latency:?} on the node under repair"
+        );
+    }
+
     // The sub-requests of a fan-out are queued while the in-flight requests are being polled, so
     // they must wake the connection task instead of waiting for an unrelated request to finish.
     #[test]
