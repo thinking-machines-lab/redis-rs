@@ -1545,6 +1545,52 @@ mod cluster_async {
         assert_eq!(result.unwrap(), Ok(Value::Okay));
     }
 
+    // A response timeout is the only sign of a connection whose packets are silently dropped, so
+    // the retry must repair that connection instead of reusing it unchecked.
+    #[test]
+    fn test_async_cluster_response_timeout_repairs_the_connection() {
+        let name = "test_async_cluster_response_timeout_repairs_the_connection";
+        let gets = AtomicU32::new(0);
+        let checks_after_timeout = Arc::new(AtomicU32::new(0));
+        let MockEnv {
+            async_connection: mut connection,
+            handler: _handler,
+            runtime,
+            ..
+        } = MockEnv::new(name, {
+            let checks_after_timeout = checks_after_timeout.clone();
+            move |cmd: &[u8], _| {
+                if is_connection_check(cmd) && gets.load(Ordering::SeqCst) > 0 {
+                    checks_after_timeout.fetch_add(1, Ordering::SeqCst);
+                }
+                respond_startup(name, cmd)?;
+                if gets.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(Err(
+                        std::io::Error::from(std::io::ErrorKind::TimedOut).into()
+                    ))
+                } else {
+                    Err(Ok(Value::Okay))
+                }
+            }
+        });
+
+        let result = runtime.block_on(async move {
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                cmd("GET").arg("test").query_async::<Value>(&mut connection),
+            )
+            .await;
+            // Let a repair that races the retry finish before checking for it.
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            result
+        });
+        assert_eq!(result.unwrap(), Ok(Value::Okay));
+        assert!(
+            checks_after_timeout.load(Ordering::SeqCst) > 0,
+            "the timed-out connection was reused without being checked"
+        );
+    }
+
     // The sub-requests of a fan-out are queued while the in-flight requests are being polled, so
     // they must wake the connection task instead of waiting for an unrelated request to finish.
     #[test]
