@@ -215,6 +215,17 @@ pub(crate) fn choose_response<C>(
             (retry, PollFlushAction::ReconnectFromInitialConnections)
         }
 
+        // A connection whose packets are silently dropped never fails on its own; the
+        // response timeout is the only sign of it. Retrying on that connection would
+        // wait out every retry, so repair it (a PING decides whether to replace it).
+        (OperationTarget::Node { address }, _) if err.is_timeout() => (
+            retry_or_send!(|mut request: PendingRequest<C>| {
+                request.cmd.reset_routing();
+                Retry::MoveToPending { request }
+            }),
+            PollFlushAction::Reconnect(HashSet::from([address])),
+        ),
+
         (OperationTarget::Node { address }, RetryMethod::Reconnect) => (
             retry_or_send!(|mut request: PendingRequest<C>| {
                 request.cmd.reset_routing();
