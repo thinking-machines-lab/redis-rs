@@ -964,11 +964,17 @@ where
             subscription_tracker,
         )
         .await?;
-        self.conn_lock
+        let replaced = self
+            .conn_lock
             .write()
             .await
             .0
             .insert(addr.clone(), ConnState::Connected(conn.clone()));
+        // Installing a connection for a node under repair ends its `reconnect_loop` without
+        // resubscribing, so restore the node's subscriptions here.
+        if !matches!(replaced, Some(ConnState::Connected(_))) {
+            self.resubscribe_node(addr).await;
+        }
         Ok(conn)
     }
 
@@ -1117,8 +1123,12 @@ where
             subscription_pipelines(&tracker, slot_map, self.routing_strategy.as_deref())
         };
 
-        for addr in connections.keys() {
-            if let Some(subscription_pipe) = pipelines.remove(addr) {
+        // A node under repair has no connection to subscribe on, and the routing error would
+        // reconnect every node; its repair resubscribes it once a connection is installed.
+        for (addr, state) in connections {
+            if matches!(state, ConnState::Connected(_))
+                && let Some(subscription_pipe) = pipelines.remove(addr)
+            {
                 self.send_subscription_pipeline(addr, subscription_pipe);
             }
         }

@@ -3722,6 +3722,80 @@ mod cluster_async {
             check_publishing(&mut publish_conn, &mut rx, supports_redis_7).await;
         }
 
+        // A stalled node gets a background repair, and the slot refresh triggered by its retry's
+        // MOVED must not resubscribe on the node's missing connection: the resulting
+        // ClusterConnectionNotFound would reconnect every node and stall the healthy shards.
+        #[async_test]
+        async fn test_pub_sub_slot_refresh_skips_a_node_under_repair() {
+            if !use_protocol().supports_resp3() {
+                return;
+            }
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let ctx = TestClusterContext::new_insecure_with_cluster_client_builder(|builder| {
+                builder
+                    .push_sender(tx.clone())
+                    .response_timeout(Duration::from_millis(300))
+                    .overall_response_timeout(Some(Duration::from_secs(10)))
+            });
+            let mut conn = ctx.async_connection().await;
+
+            // In a three-node cluster {bar} (slot 5061) and {foo} (slot 12182) live on different
+            // primaries.
+            let _: () = conn.ssubscribe("{bar}channel").await.unwrap();
+            let bar_primary = RoutingInfo::SingleNode(SingleNodeRoutingInfo::SpecificNode(
+                Route::new(5061, SlotAddr::Master),
+            ));
+            let mut pause = cmd("CLIENT");
+            pause.arg("PAUSE").arg(3000).arg("ALL");
+            conn.route_command(pause, bar_primary).await.unwrap();
+
+            let mut publisher = conn.clone();
+            let mut stuck = conn.clone();
+            let stuck_set = async move {
+                let _ = cmd("SET")
+                    .arg("{bar}k")
+                    .arg("v")
+                    .query_async::<Value>(&mut stuck)
+                    .await;
+            };
+            let probe = async move {
+                // Past the response timeout, so the repair, the retry's MOVED and the slot
+                // refresh are underway.
+                sleep(futures_time::time::Duration::from_millis(400)).await;
+                let mut slowest = Duration::ZERO;
+                for _ in 0..20 {
+                    let start = std::time::Instant::now();
+                    let _: Value = cmd("GET")
+                        .arg("{foo}k")
+                        .query_async(&mut conn)
+                        .await
+                        .unwrap();
+                    slowest = slowest.max(start.elapsed());
+                    sleep(futures_time::time::Duration::from_millis(50)).await;
+                }
+                slowest
+            };
+            let ((), slowest) = join!(stuck_set, probe);
+            assert!(
+                slowest < Duration::from_millis(200),
+                "a healthy shard took {slowest:?} while another node was repaired"
+            );
+
+            // Once the node is repaired, its subscription is restored.
+            let _: () = publisher.spublish("{bar}channel", "after").await.unwrap();
+            loop {
+                let push = rx
+                    .recv()
+                    .timeout(futures_time::time::Duration::from_secs(5))
+                    .await
+                    .expect("the subscription was not restored after the repair")
+                    .unwrap();
+                if push.kind == PushKind::SMessage {
+                    break;
+                }
+            }
+        }
+
         #[async_test]
         async fn test_pub_sub_should_not_reconnect_if_subscription_failed() {
             if !use_protocol().supports_resp3() {
